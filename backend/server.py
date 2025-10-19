@@ -1,96 +1,126 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-import certifi
-import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict, EmailStr
-from typing import List, Optional, Dict
-import uuid
+from dotenv import load_dotenv
+from pydantic import BaseModel, EmailStr
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
-from emergentintegrations.llm.chat import LlmChat, UserMessage
-from bson import ObjectId
-import asyncio
-import math
+import os
+import certifi
+from pathlib import Path
 
-# ================== CONFIG ==================
+# ===================== CONFIG =====================
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB connection (with TLS for Render)
 MONGO_URI = os.getenv("MONGO_URL")
-DB_NAME = os.getenv("DB_NAME", "ai_money_agent")
+JWT_SECRET = os.getenv("JWT_SECRET", "supersecretkey")
+JWT_EXP_MINUTES = 60 * 24 * 7  # 7 days
 
-client = AsyncIOMotorClient(MONGO_URI, tls=True, tlsCAFile=certifi.where())
-db = client[DB_NAME]
+# ===================== APP SETUP =====================
 
-# Environment variables
-JWT_SECRET = os.environ.get("JWT_SECRET", "fallback-secret")
-EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
-
-# FastAPI app
 app = FastAPI()
-api_router = APIRouter(prefix="/api")
-security = HTTPBearer()
-
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ================== CORS ==================
-
-origins = [
-    "https://ai-money-agent-frontend.onrender.com",
-    "http://localhost:5173",
-    "http://localhost:3000",
-]
+auth_scheme = HTTPBearer()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ================== HELPERS ==================
+# ===================== DATABASE =====================
 
-def fix_object_ids(data):
-    """Recursively convert ObjectId fields to strings so FastAPI can encode them."""
-    if isinstance(data, list):
-        return [fix_object_ids(item) for item in data]
-    elif isinstance(data, dict):
-        return {k: fix_object_ids(v) for k, v in data.items()}
-    elif isinstance(data, ObjectId):
-        return str(data)
-    else:
-        return data
+client = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
+db = client["ai_money_agent_sa"]  # ✅ match your database name
 
-# ================== MODELS ==================
+# ===================== MODELS =====================
 
-class User(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    email: EmailStr
-    password: Optional[str] = None
+class UserSignup(BaseModel):
     name: str
-    city: Optional[str] = None
-    province: Optional[str] = None
-    radius: int = 25
-    job_types: List[str] = []
-    skills: List[str] = []
-    cv_files: List[Dict[str, str]] = []
-    is_admin: bool = False
-    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    email: EmailStr
+    password: str
 
-class Subscription(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
-    plan: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+
+# ===================== HELPERS =====================
+
+def create_jwt(user_id: str):
+    payload = {
+        "user_id": user_id,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=JWT_EXP_MINUTES),
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    return token
+
+
+# ===================== ROUTES =====================
+
+@app.get("/")
+async def home():
+    return {"message": "✅ AI Money Agent backend running!"}
+
+
+@app.post("/api/auth/signup")
+async def signup(data: UserSignup):
+    existing = await db.users.find_one({"email": data.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    hashed_pw = bcrypt.hashpw(data.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    user = {
+        "name": data.name,
+        "email": data.email,
+        "password": hashed_pw,
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    result = await db.users.insert_one(user)
+    user["_id"] = str(result.inserted_id)  # ✅ fix ObjectId issue
+
+    token = create_jwt(user["_id"])
+
+    return {"message": "User created successfully", "token": token, "user": user}
+
+
+@app.post("/api/auth/login")
+async def login(data: UserLogin):
+    user = await db.users.find_one({"email": data.email})
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid email or password")
+
+    if not bcrypt.checkpw(data.password.encode("utf-8"), user["password"].encode("utf-8")):
+        raise HTTPException(status_code=400, detail="Invalid email or password")
+
+    token = create_jwt(str(user["_id"]))
+
+    return {"message": "Login successful", "token": token}
+
+
+@app.get("/api/users/me")
+async def get_me(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        user_id = payload.get("user_id")
+        user = await db.users.find_one({"_id": user_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        user["_id"] = str(user["_id"])
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ====================================================
+
